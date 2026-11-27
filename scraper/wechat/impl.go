@@ -1,6 +1,7 @@
 package wechat
 
 import (
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -67,8 +68,12 @@ const wechatStealthJS = `
 const itemsJS = `() => {
   const out = [];
   document.querySelectorAll('div.post-feed-item').forEach((it) => {
-    const t = it.querySelector('.post-title');
+    const t = it.querySelector('.post-title, .post-desc, .post-description, [class*="post-title"], [class*="post-desc"]');
     const tm = it.querySelector('.time-label');
+    const lines = (it.innerText || '').split(/\n+/).map(s => s.trim()).filter(Boolean);
+    const timeIndex = lines.findIndex(s => /^\d{4}年\d{1,2}月\d{1,2}日/.test(s));
+    const fallbackTitle = lines.slice(0, timeIndex < 0 ? 0 : timeIndex).find(s =>
+      s.length > 1 && s.length < 200 && !/^(?:\d{1,2}:\d{2}|\d+(?:\.\d+)?[万亿]?|编辑|修改描述和封面|置顶|分享|删除|可见权限|已发表)$/.test(s));
     const d = {};
     it.querySelectorAll('.post-data .data-item').forEach((row) => {
       const el = row.querySelector('.icon');
@@ -95,7 +100,7 @@ const itemsJS = `() => {
       video_id: post && typeof post.exportId === 'string' && /^export\/[A-Za-z0-9_-]+$/.test(post.exportId)
         ? post.exportId.slice('export/'.length) : (idNode ? (idNode.getAttribute('data-video-id') || idNode.getAttribute('data-post-id') || '') : ''),
       links: [...it.querySelectorAll('a[href]')].map(a => a.href),
-      title: t ? String(t.textContent).trim() : '',
+      title: (t ? String(t.textContent).trim() : '') || fallbackTitle || '',
       publish_time: tm ? String(tm.textContent).trim() : '',
       stats: d,
     });
@@ -548,6 +553,21 @@ func ScrapeWechat(opts WechatOptions) (res *Result, err error) {
 	return collectWechat(page, b, opts)
 }
 
+func wechatDiagnostic(page *rod.Page) string {
+	var parts []string
+	for _, fr := range listFrames(page) {
+		var info struct {
+			Rows int    `json:"rows"`
+			Text string `json:"text"`
+		}
+		if !evalJSON(fr, `() => ({rows: document.querySelectorAll('div.post-feed-item').length, text: (document.body?.innerText || '').slice(0, 180)})`, &info) {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("url=%q rows=%d text=%q", currentURL(fr), info.Rows, info.Text))
+	}
+	return strings.Join(parts, "; ")
+}
+
 func collectWechat(page *rod.Page, b *rod.Browser, opts WechatOptions) (*Result, error) {
 	if !strings.Contains(currentURL(page), wechatListURL) {
 		if err := page.Timeout(60 * time.Second).Navigate(wechatListURL); err != nil {
@@ -556,16 +576,25 @@ func collectWechat(page *rod.Page, b *rod.Browser, opts WechatOptions) (*Result,
 		time.Sleep(4 * time.Second)
 	}
 	scope := waitWechatContentFrame(page, 40)
-	videos := extractWechatItems(scope)
+	collectItems := func() []wechatRawItem {
+		var best []wechatRawItem
+		for _, fr := range listFrames(page) {
+			if items := extractWechatItems(fr); len(items) > len(best) {
+				best = items
+			}
+		}
+		return best
+	}
+	videos := collectItems()
 	for i := 0; i < 20 && len(videos) == 0; i++ {
 		time.Sleep(1 * time.Second)
-		videos = extractWechatItems(scope)
+		videos = collectItems()
 	}
 	stable := 0
 	for i := 0; i < 30; i++ {
 		_, _ = safeEval(scope, 5*time.Second, wechatScrollJS)
 		time.Sleep(1500 * time.Millisecond)
-		newItems := extractWechatItems(scope)
+		newItems := collectItems()
 		if len(newItems) > len(videos) {
 			videos = newItems
 			stable = 0
@@ -583,11 +612,10 @@ func collectWechat(page *rod.Page, b *rod.Browser, opts WechatOptions) (*Result,
 		logInfo("[wechat] 列表为空，重新加载列表页重试一次")
 		if err := page.Timeout(60 * time.Second).Navigate(wechatListURL); err == nil {
 			time.Sleep(4 * time.Second)
-			if scope2 := waitWechatContentFrame(page, 20); scope2 != nil {
-				for i := 0; i < 10 && len(videos) == 0; i++ {
-					time.Sleep(1 * time.Second)
-					videos = extractWechatItems(scope2)
-				}
+			_ = waitWechatContentFrame(page, 20)
+			for i := 0; i < 10 && len(videos) == 0; i++ {
+				time.Sleep(1 * time.Second)
+				videos = collectItems()
 			}
 		}
 	}
@@ -598,6 +626,9 @@ func collectWechat(page *rod.Page, b *rod.Browser, opts WechatOptions) (*Result,
 		}
 	}
 	logInfo("[wechat] 列表采集完成，条数:", len(videos))
+	if len(videos) == 0 {
+		return nil, errF("视频列表未识别，无法确认采集结果；页面诊断: %s", wechatDiagnostic(page))
+	}
 	if err := page.Timeout(60 * time.Second).Navigate(wechatHomeURL); err != nil {
 		return nil, err
 	}

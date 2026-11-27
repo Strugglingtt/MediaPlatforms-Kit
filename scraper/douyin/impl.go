@@ -24,7 +24,9 @@ const rowsJS = `() => {
   for (const e of document.querySelectorAll('div')) {
     if (!visible(e) || !e.parentElement || !date.test(text(e)) || text(e).length > 900) continue;
     const peers = [...e.parentElement.children].filter(x => x.tagName === e.tagName && visible(x) && date.test(text(x)));
-    if (peers.length >= 2 && !peers.some(x => x !== e && e.contains(x))) candidates.push(e);
+    const singleCard = /编辑作品|设置权限|作品置顶|删除作品/.test(text(e)) &&
+      /播放|点赞|评论|分享/.test(text(e));
+    if ((peers.length >= 2 || singleCard) && !peers.some(x => x !== e && e.contains(x))) candidates.push(e);
   }
   const rows = [];
   for (const e of candidates) {
@@ -516,15 +518,17 @@ func refreshDouyinQR(page *rod.Page, session *PendingLogin) {
 
 func douyinDiagnostic(page *rod.Page) string {
 	type diag struct {
-		Images        int `json:"images"`
-		Canvases      int `json:"canvases"`
-		Frames        int `json:"frames"`
-		CandidateRows int `json:"candidate_rows"`
+		URL           string `json:"url"`
+		Text          string `json:"text"`
+		Images        int    `json:"images"`
+		Canvases      int    `json:"canvases"`
+		Frames        int    `json:"frames"`
+		CandidateRows int    `json:"candidate_rows"`
 	}
 	var parts []string
 	for _, fr := range listFrames(page) {
 		var d diag
-		if !evalJSON(fr, `() => ({images: document.querySelectorAll('img').length, canvases: document.querySelectorAll('canvas').length, frames: document.querySelectorAll('iframe').length})`, &d) {
+		if !evalJSON(fr, `() => ({url: location.href, text: (document.body?.innerText || '').slice(0, 180), images: document.querySelectorAll('img').length, canvases: document.querySelectorAll('canvas').length, frames: document.querySelectorAll('iframe').length})`, &d) {
 			parts = append(parts, `{"unavailable": true}`)
 			continue
 		}
